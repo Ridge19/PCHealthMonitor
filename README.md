@@ -16,11 +16,3 @@
 | **Color Coded**      | Green/yellow/red thresholds so you can spot problems at a glance          |
 | **Lightweight**      | Single compiled binary, no runtime dependencies, near-zero overhead       |
 | **Native Linux**     | Reads directly from `/proc` and `/sys` — no external tools required  |
-
-## Quick Start
-
-### One-Line Install
-
-```bash
-curl -sL https://raw.githubusercontent.com/ridge/pchealth/main/scripts/quick-install.sh | bash
-```
