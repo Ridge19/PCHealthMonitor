@@ -7,17 +7,30 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
-#include <poll.h>
 #include <sstream>
 #include <thread>
 
+#ifdef _WIN32
+#include <conio.h>
+#include <windows.h>
+#else
+#include <poll.h>
 #include <unistd.h>
+#endif
 
 namespace pcm {
 
 PCHealthMonitorApp* PCHealthMonitorApp::instance_ = nullptr;
 
 namespace {
+
+std::string platformLabel() {
+#ifdef _WIN32
+    return "Windows";
+#else
+    return "Linux";
+#endif
+}
 
 std::string makeBar(double percent, int width = 30) {
     int filled = static_cast<int>(std::round(percent / 100.0 * width));
@@ -82,12 +95,17 @@ void PCHealthMonitorApp::signalHandler(int) {
 }
 
 void PCHealthMonitorApp::setupSignals() const {
+#ifdef _WIN32
+    std::signal(SIGINT, PCHealthMonitorApp::signalHandler);
+    std::signal(SIGTERM, PCHealthMonitorApp::signalHandler);
+#else
     struct sigaction sa {};
     sa.sa_handler = PCHealthMonitorApp::signalHandler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+#endif
 }
 
 std::vector<std::string> PCHealthMonitorApp::buildFrame() {
@@ -106,7 +124,7 @@ std::vector<std::string> PCHealthMonitorApp::buildFrame() {
       "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557" +
       Color::RESET);
     S(Color::BOLD + Color::MAGENTA +
-      "   \u2551                      PC HEALTH MONITOR (Linux)                        \u2551" + Color::RESET);
+            "   \u2551                     PC HEALTH MONITOR (" + platformLabel() +")                      \u2551" + Color::RESET);
     S(Color::BOLD + Color::MAGENTA +
       "   \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
       "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
@@ -208,7 +226,11 @@ std::vector<std::string> PCHealthMonitorApp::buildFrame() {
     S(Color::BOLD + Color::CYAN + "  \u2550\u2550\u2550 TEMPERATURE \u2550\u2550\u2550" + Color::RESET);
     const auto temps = SystemMetrics::getTemperatures();
     if (temps.empty()) {
+#ifdef _WIN32
+        S("  " + Color::YELLOW + "\u26a0 No temperature sensors exposed by this Windows setup" + Color::RESET);
+#else
         S("  " + Color::YELLOW + "\u26a0 No sensors (try: sudo apt install lm-sensors && sudo sensors-detect)" + Color::RESET);
+#endif
     } else {
         const int cols = (ts.cols >= 100) ? 3 : 2;
         for (size_t i = 0; i < temps.size(); i += cols) {
@@ -329,7 +351,11 @@ std::vector<std::string> PCHealthMonitorApp::buildFrame() {
         const auto now = std::chrono::system_clock::now();
         const auto raw = std::chrono::system_clock::to_time_t(now);
         struct tm local {};
+    #ifdef _WIN32
+        localtime_s(&local, &raw);
+    #else
         localtime_r(&raw, &local);
+    #endif
 
         std::ostringstream out;
         out << Color::DIM << "  Updated: " << std::put_time(&local, "%Y-%m-%d %H:%M:%S") << "  |  Refresh: 2s" << Color::RESET;
@@ -341,6 +367,60 @@ std::vector<std::string> PCHealthMonitorApp::buildFrame() {
 }
 
 void PCHealthMonitorApp::inputLoop() {
+#ifdef _WIN32
+    while (running_) {
+        if (!_kbhit()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        int key = _getch();
+
+        const TermSize ts = getTermSize();
+        const int viewHeight = ts.rows - 2;
+        const int total = totalLines_.load();
+        const int maxScroll = std::max(0, total - viewHeight);
+        const int current = scrollOffset_.load();
+
+        if (key == 'q' || key == 'Q') {
+            running_ = false;
+        } else if (key == 'k' || key == 'K') {
+            scrollOffset_ = std::max(0, current - 1);
+        } else if (key == 'j' || key == 'J') {
+            scrollOffset_ = std::min(maxScroll, current + 1);
+        } else if (key == 'g') {
+            scrollOffset_ = 0;
+        } else if (key == 'G') {
+            scrollOffset_ = maxScroll;
+        } else if (key == ' ') {
+            scrollOffset_ = std::min(maxScroll, current + viewHeight);
+        } else if (key == 0 || key == 224) {
+            const int ext = _getch();
+            switch (ext) {
+                case 72:  // up
+                    scrollOffset_ = std::max(0, current - 1);
+                    break;
+                case 80:  // down
+                    scrollOffset_ = std::min(maxScroll, current + 1);
+                    break;
+                case 73:  // page up
+                    scrollOffset_ = std::max(0, current - viewHeight);
+                    break;
+                case 81:  // page down
+                    scrollOffset_ = std::min(maxScroll, current + viewHeight);
+                    break;
+                case 71:  // home
+                    scrollOffset_ = 0;
+                    break;
+                case 79:  // end
+                    scrollOffset_ = maxScroll;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+#else
     while (running_) {
         struct pollfd pfd {};
         pfd.fd = STDIN_FILENO;
@@ -437,6 +517,7 @@ void PCHealthMonitorApp::inputLoop() {
             scrollOffset_ = std::min(maxScroll, current + viewHeight);
         }
     }
+#endif
 }
 
 int PCHealthMonitorApp::run() {

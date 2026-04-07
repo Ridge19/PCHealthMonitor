@@ -1,8 +1,13 @@
 #pragma once
 
 #include <string>
-#include <termios.h>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <termios.h>
+#endif
 
 namespace pcm {
 
@@ -41,7 +46,12 @@ private:
     void enterAltScreen() const;
     void leaveAltScreen() const;
 
+#ifdef _WIN32
+    DWORD origInMode_ = 0;
+    DWORD origOutMode_ = 0;
+#else
     termios origTermios_{};
+#endif
     bool rawModeEnabled_ = false;
 };
 

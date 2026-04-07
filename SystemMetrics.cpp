@@ -4,6 +4,7 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -11,9 +12,14 @@
 #include <numeric>
 #include <sstream>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <tlhelp32.h>
+#else
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -38,7 +44,11 @@ std::string execCommand(const std::string& cmd) {
     std::array<char, 256> buffer{};
     std::string result;
 
+#ifdef _WIN32
+    FILE* pipe = _popen(cmd.c_str(), "r");
+#else
     FILE* pipe = popen(cmd.c_str(), "r");
+#endif
     if (!pipe) {
         return "";
     }
@@ -47,7 +57,11 @@ std::string execCommand(const std::string& cmd) {
         result += buffer.data();
     }
 
+#ifdef _WIN32
+    _pclose(pipe);
+#else
     pclose(pipe);
+#endif
 
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
@@ -72,12 +86,16 @@ std::string formatBytes(long long bytes) {
 }  // namespace
 
 CPUMonitor::CPUMonitor() {
+#ifdef _WIN32
+    numCores_ = static_cast<int>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+#else
     numCores_ = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
     const auto times = readProcStat();
     if (!times.empty()) {
         prevTotal_ = times[0];
         prevTimes_.assign(times.begin() + 1, times.end());
     }
+#endif
 }
 
 int CPUMonitor::getNumCores() const {
@@ -107,6 +125,51 @@ std::vector<CPUTimes> CPUMonitor::readProcStat() const {
 }
 
 double CPUMonitor::getUsage(std::vector<double>& perCore) {
+#ifdef _WIN32
+    FILETIME idleTime {};
+    FILETIME kernelTime {};
+    FILETIME userTime {};
+    perCore.clear();
+
+    if (!GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
+        return -1.0;
+    }
+
+    auto ftToU64 = [](const FILETIME& ft) -> unsigned long long {
+        ULARGE_INTEGER value {};
+        value.LowPart = ft.dwLowDateTime;
+        value.HighPart = ft.dwHighDateTime;
+        return value.QuadPart;
+    };
+
+    CPUTimes cur{};
+    cur.idle = static_cast<long long>(ftToU64(idleTime));
+    const unsigned long long kernel = ftToU64(kernelTime);
+    const unsigned long long user = ftToU64(userTime);
+    cur.system = static_cast<long long>(kernel > static_cast<unsigned long long>(cur.idle) ? kernel - cur.idle : 0ULL);
+    cur.user = static_cast<long long>(user);
+
+    if (firstRead_) {
+        prevTotal_ = cur;
+        firstRead_ = false;
+        return -1.0;
+    }
+
+    const long long td = cur.total() - prevTotal_.total();
+    const long long id = cur.totalIdle() - prevTotal_.totalIdle();
+
+    double totalUsage = -1.0;
+    if (td > 0) {
+        totalUsage = (1.0 - static_cast<double>(id) / static_cast<double>(td)) * 100.0;
+    }
+
+    if (totalUsage >= 0.0) {
+        perCore.assign(static_cast<size_t>(std::max(1, numCores_)), totalUsage);
+    }
+
+    prevTotal_ = cur;
+    return totalUsage;
+#else
     const auto times = readProcStat();
     perCore.clear();
     if (times.empty()) {
@@ -141,10 +204,61 @@ double CPUMonitor::getUsage(std::vector<double>& perCore) {
     firstRead_ = false;
 
     return totalUsage;
+#endif
 }
 
 CPUInfo SystemMetrics::getCPUInfo() {
     CPUInfo info;
+#ifdef _WIN32
+    info.logicalCores = static_cast<int>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    info.modelName = execCommand("powershell -NoProfile -Command \"(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)\"");
+    if (info.modelName.empty()) {
+        info.modelName = "Windows CPU";
+    }
+
+    const std::string cores = execCommand(
+        "powershell -NoProfile -Command \"(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum\"");
+    if (!cores.empty()) {
+        try {
+            info.physicalCores = std::stoi(cores);
+        } catch (...) {
+        }
+    }
+    if (info.physicalCores <= 0) {
+        info.physicalCores = info.logicalCores;
+    }
+
+    const std::string maxMhz =
+        execCommand("powershell -NoProfile -Command \"(Get-CimInstance Win32_Processor | Measure-Object -Property MaxClockSpeed -Average).Average\"");
+    if (!maxMhz.empty()) {
+        try {
+            info.maxMHz = std::stod(maxMhz);
+        } catch (...) {
+        }
+    }
+
+    const std::string l3Kb = execCommand(
+        "powershell -NoProfile -Command \"(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty L3CacheSize)\"");
+    if (!l3Kb.empty()) {
+        info.cacheSize = l3Kb + " KB";
+    }
+
+    SYSTEM_INFO si {};
+    GetNativeSystemInfo(&si);
+    switch (si.wProcessorArchitecture) {
+        case PROCESSOR_ARCHITECTURE_AMD64:
+            info.architecture = "x64";
+            break;
+        case PROCESSOR_ARCHITECTURE_ARM64:
+            info.architecture = "ARM64";
+            break;
+        default:
+            info.architecture = "Unknown";
+            break;
+    }
+
+    return info;
+#else
     info.logicalCores = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
 
     std::ifstream file("/proc/cpuinfo");
@@ -206,9 +320,23 @@ CPUInfo SystemMetrics::getCPUInfo() {
     }
 
     return info;
+#endif
 }
 
 double SystemMetrics::getCurrentAvgMHz(int logicalCores) {
+#ifdef _WIN32
+    (void)logicalCores;
+    const std::string cur =
+        execCommand("powershell -NoProfile -Command \"(Get-CimInstance Win32_Processor | Measure-Object -Property CurrentClockSpeed -Average).Average\"");
+    if (cur.empty()) {
+        return 0.0;
+    }
+    try {
+        return std::stod(cur);
+    } catch (...) {
+        return 0.0;
+    }
+#else
     double total = 0.0;
     int count = 0;
     for (int i = 0; i < logicalCores; ++i) {
@@ -222,10 +350,28 @@ double SystemMetrics::getCurrentAvgMHz(int logicalCores) {
         }
     }
     return count > 0 ? total / static_cast<double>(count) : 0.0;
+#endif
 }
 
 MemoryInfo SystemMetrics::getMemoryInfo() {
     MemoryInfo info;
+#ifdef _WIN32
+    MEMORYSTATUSEX mem {};
+    mem.dwLength = sizeof(mem);
+    if (!GlobalMemoryStatusEx(&mem)) {
+        return info;
+    }
+
+    auto toGB = [](unsigned long long bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0); };
+
+    info.totalGB = toGB(mem.ullTotalPhys);
+    info.availableGB = toGB(mem.ullAvailPhys);
+    info.usedGB = info.totalGB - info.availableGB;
+    info.swapTotalGB = toGB(mem.ullTotalPageFile);
+    info.swapUsedGB = toGB(mem.ullTotalPageFile - mem.ullAvailPageFile);
+    info.usagePercent = info.totalGB > 0.0 ? (info.usedGB / info.totalGB) * 100.0 : 0.0;
+    return info;
+#else
     std::ifstream file("/proc/meminfo");
     if (!file.is_open()) {
         return info;
@@ -259,10 +405,42 @@ MemoryInfo SystemMetrics::getMemoryInfo() {
     }
 
     return info;
+#endif
 }
 
 std::vector<DiskInfo> SystemMetrics::getDiskInfo() {
     std::vector<DiskInfo> disks;
+#ifdef _WIN32
+    char drives[256] = {};
+    const DWORD len = GetLogicalDriveStringsA(static_cast<DWORD>(sizeof(drives)), drives);
+    if (len == 0 || len > sizeof(drives)) {
+        return disks;
+    }
+
+    for (const char* d = drives; *d != '\0'; d += std::strlen(d) + 1) {
+        if (GetDriveTypeA(d) != DRIVE_FIXED) {
+            continue;
+        }
+
+        ULARGE_INTEGER freeAvail {};
+        ULARGE_INTEGER total {};
+        ULARGE_INTEGER freeTotal {};
+        if (!GetDiskFreeSpaceExA(d, &freeAvail, &total, &freeTotal) || total.QuadPart == 0) {
+            continue;
+        }
+
+        DiskInfo info;
+        info.mountPoint = d;
+        info.device = d;
+        info.filesystem = "NTFS/ReFS";
+        info.totalGB = static_cast<double>(total.QuadPart) / (1024.0 * 1024.0 * 1024.0);
+        info.freeGB = static_cast<double>(freeTotal.QuadPart) / (1024.0 * 1024.0 * 1024.0);
+        info.usedGB = info.totalGB - info.freeGB;
+        info.usagePercent = info.totalGB > 0.0 ? (info.usedGB / info.totalGB) * 100.0 : 0.0;
+        disks.push_back(info);
+    }
+    return disks;
+#else
     std::ifstream file("/proc/mounts");
     if (!file.is_open()) {
         return disks;
@@ -307,6 +485,7 @@ std::vector<DiskInfo> SystemMetrics::getDiskInfo() {
         disks.push_back(d);
     }
     return disks;
+#endif
 }
 
 std::vector<TempReading> SystemMetrics::getTemperatures() {
@@ -377,6 +556,38 @@ std::vector<TempReading> SystemMetrics::getTemperatures() {
 std::vector<GPUInfo> SystemMetrics::getGPUInfo() {
     std::vector<GPUInfo> gpus;
 
+#ifdef _WIN32
+    const std::string output = execCommand(
+        "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name + '|' + $_.DriverVersion + '|' + $_.AdapterRAM }\"");
+    if (!output.empty()) {
+        std::istringstream iss(output);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (line.empty()) {
+                continue;
+            }
+
+            GPUInfo g;
+            std::istringstream ls(line);
+            std::getline(ls, g.name, '|');
+            std::getline(ls, g.driver, '|');
+            std::string ram;
+            std::getline(ls, ram, '|');
+            if (!ram.empty()) {
+                try {
+                    const auto bytes = std::stoull(ram);
+                    g.vram = formatBytes(static_cast<long long>(bytes));
+                } catch (...) {
+                }
+            }
+            if (!g.name.empty()) {
+                gpus.push_back(g);
+            }
+        }
+    }
+    return gpus;
+#else
+
     const std::string nvidia = execCommand(
         "nvidia-smi --query-gpu=name,driver_version,memory.total,temperature.gpu,utilization.gpu "
         "--format=csv,noheader,nounits 2>/dev/null");
@@ -425,10 +636,36 @@ std::vector<GPUInfo> SystemMetrics::getGPUInfo() {
     }
 
     return gpus;
+#endif
 }
 
 std::vector<NetworkInfo> SystemMetrics::getNetworkInfo() {
     std::vector<NetworkInfo> nets;
+
+#ifdef _WIN32
+    const std::string output = execCommand(
+        "powershell -NoProfile -Command \"Get-NetAdapter -Physical | ForEach-Object { $_.Name + '|' + $_.Status + '|' + $_.LinkSpeed + '|' + $_.MacAddress }\"");
+    if (!output.empty()) {
+        std::istringstream iss(output);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (line.empty()) {
+                continue;
+            }
+
+            NetworkInfo n;
+            std::istringstream ls(line);
+            std::getline(ls, n.name, '|');
+            std::getline(ls, n.state, '|');
+            std::getline(ls, n.speed, '|');
+            std::getline(ls, n.macAddress, '|');
+            if (!n.name.empty()) {
+                nets.push_back(n);
+            }
+        }
+    }
+    return nets;
+#else
 
     try {
         for (const auto& entry : fs::directory_iterator("/sys/class/net")) {
@@ -472,10 +709,39 @@ std::vector<NetworkInfo> SystemMetrics::getNetworkInfo() {
     }
 
     return nets;
+#endif
 }
 
 BatteryInfo SystemMetrics::getBatteryInfo() {
     BatteryInfo b;
+
+#ifdef _WIN32
+    const std::string output = execCommand(
+        "powershell -NoProfile -Command \"Get-CimInstance Win32_Battery | Select-Object -First 1 EstimatedChargeRemaining,BatteryStatus | ForEach-Object { $_.EstimatedChargeRemaining.ToString() + '|' + $_.BatteryStatus.ToString() }\"");
+    if (!output.empty()) {
+        std::istringstream ls(output);
+        std::string percent;
+        std::string status;
+        std::getline(ls, percent, '|');
+        std::getline(ls, status, '|');
+
+        b.hasBattery = true;
+        try {
+            b.percent = std::stoi(percent);
+        } catch (...) {
+        }
+        if (status == "1") {
+            b.status = "Discharging";
+        } else if (status == "2") {
+            b.status = "AC";
+        } else if (status == "6") {
+            b.status = "Charging";
+        } else {
+            b.status = "Unknown";
+        }
+    }
+    return b;
+#else
 
     auto readDouble = [](const std::string& path) -> double {
         const std::string raw = readFile(path);
@@ -547,10 +813,26 @@ BatteryInfo SystemMetrics::getBatteryInfo() {
     }
 
     return b;
+#endif
 }
 
 OSInfo SystemMetrics::getOSInfo() {
     OSInfo info;
+
+#ifdef _WIN32
+    info.prettyName = execCommand("powershell -NoProfile -Command \"(Get-CimInstance Win32_OperatingSystem).Caption\"");
+    if (info.prettyName.empty()) {
+        info.prettyName = "Windows";
+    }
+    info.kernel = execCommand("cmd /c ver");
+
+    char host[256] = {};
+    DWORD hostLen = static_cast<DWORD>(sizeof(host));
+    if (GetComputerNameA(host, &hostLen)) {
+        info.hostname = host;
+    }
+    return info;
+#else
 
     std::ifstream file("/etc/os-release");
     if (file.is_open()) {
@@ -576,18 +858,27 @@ OSInfo SystemMetrics::getOSInfo() {
     }
 
     return info;
+#endif
 }
 
 LoadAvg SystemMetrics::getLoadAverage() {
+#ifdef _WIN32
+    return {};
+#else
     LoadAvg la;
     std::ifstream file("/proc/loadavg");
     if (file.is_open()) {
         file >> la.avg1 >> la.avg5 >> la.avg15;
     }
     return la;
+#endif
 }
 
 std::string SystemMetrics::getUptime() {
+#ifdef _WIN32
+    const unsigned long long seconds = GetTickCount64() / 1000ULL;
+    int s = static_cast<int>(seconds);
+#else
     std::ifstream file("/proc/uptime");
     double seconds = 0;
     if (file.is_open()) {
@@ -595,6 +886,7 @@ std::string SystemMetrics::getUptime() {
     }
 
     int s = static_cast<int>(seconds);
+#endif
     const int d = s / 86400;
     const int h = (s % 86400) / 3600;
     const int m = (s % 3600) / 60;
@@ -610,6 +902,23 @@ std::string SystemMetrics::getUptime() {
 }
 
 int SystemMetrics::getProcessCount() {
+#ifdef _WIN32
+    int count = 0;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    PROCESSENTRY32 pe {};
+    pe.dwSize = sizeof(PROCESSENTRY32);
+    if (Process32First(snapshot, &pe)) {
+        do {
+            ++count;
+        } while (Process32Next(snapshot, &pe));
+    }
+    CloseHandle(snapshot);
+    return count;
+#else
     int count = 0;
     try {
         for (const auto& entry : fs::directory_iterator("/proc")) {
@@ -621,10 +930,46 @@ int SystemMetrics::getProcessCount() {
     } catch (...) {
     }
     return count;
+#endif
 }
 
 std::vector<ProcessInfo> SystemMetrics::getTopProcesses(int count) {
     std::vector<ProcessInfo> procs;
+#ifdef _WIN32
+    const std::string cmd =
+        "powershell -NoProfile -Command \"Get-Process | Sort-Object CPU -Descending | Select-Object -First " +
+        std::to_string(count) +
+        " Id,ProcessName,CPU,WorkingSet64 | ForEach-Object { $_.Id.ToString() + '|' + $_.ProcessName + '|' + ($_.CPU.ToString()) + '|' + $_.WorkingSet64.ToString() }\"";
+    const std::string output = execCommand(cmd);
+
+    std::istringstream iss(output);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.empty()) {
+            continue;
+        }
+
+        ProcessInfo p;
+        std::string cpu;
+        std::string mem;
+        std::istringstream ls(line);
+        std::string pid;
+        std::getline(ls, pid, '|');
+        std::getline(ls, p.name, '|');
+        std::getline(ls, cpu, '|');
+        std::getline(ls, mem, '|');
+
+        try {
+            p.pid = std::stoi(pid);
+            p.cpuPct = cpu.empty() ? 0.0 : std::stod(cpu);
+            p.memPct = 0.0;
+        } catch (...) {
+            continue;
+        }
+        procs.push_back(p);
+    }
+    return procs;
+#else
     const std::string output =
         execCommand("ps aux --sort=-%cpu --no-headers 2>/dev/null | head -" + std::to_string(count));
 
@@ -666,6 +1011,7 @@ std::vector<ProcessInfo> SystemMetrics::getTopProcesses(int count) {
     }
 
     return procs;
+#endif
 }
 
 }  // namespace pcm

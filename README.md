@@ -16,3 +16,10 @@
 | **Color Coded**      | Green/yellow/red thresholds so you can spot problems at a glance          |
 | **Lightweight**      | Single compiled binary, no runtime dependencies, near-zero overhead       |
 | **Native Linux**     | Reads directly from `/proc` and `/sys` — no external tools required  |
+
+## Platform Support
+
+- Linux: full native support via `/proc`, `/sys`, and standard Unix terminal APIs.
+- Windows Terminal / PowerShell: interactive UI and keyboard controls now work natively.
+- On Windows, system metrics are collected from Win32 APIs and PowerShell/CIM queries (for CPU, memory, disks, GPU, network, battery, and OS details).
+- Some values can be hardware/driver dependent on Windows (for example temperature and per-core CPU details).

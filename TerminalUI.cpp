@@ -4,17 +4,31 @@
 #include <iostream>
 #include <sstream>
 
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <sys/ioctl.h>
 #include <unistd.h>
+#endif
 
 namespace pcm {
 
 TermSize getTermSize() {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+        const int rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+        const int cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+        return {rows, cols};
+    }
+    return {24, 80};
+#else
     struct winsize w {};
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) {
         return {static_cast<int>(w.ws_row), static_cast<int>(w.ws_col)};
     }
     return {24, 80};
+#endif
 }
 
 TerminalSession::TerminalSession() {
@@ -29,6 +43,28 @@ TerminalSession::~TerminalSession() {
 }
 
 void TerminalSession::enableRawMode() {
+#ifdef _WIN32
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hIn == INVALID_HANDLE_VALUE || hOut == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    if (!GetConsoleMode(hIn, &origInMode_) || !GetConsoleMode(hOut, &origOutMode_)) {
+        return;
+    }
+
+    DWORD inMode = origInMode_;
+    inMode &= ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
+    inMode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+    DWORD outMode = origOutMode_;
+    outMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+
+    if (SetConsoleMode(hIn, inMode) && SetConsoleMode(hOut, outMode)) {
+        rawModeEnabled_ = true;
+    }
+#else
     if (tcgetattr(STDIN_FILENO, &origTermios_) != 0) {
         return;
     }
@@ -41,23 +77,42 @@ void TerminalSession::enableRawMode() {
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0) {
         rawModeEnabled_ = true;
     }
+#endif
 }
 
 void TerminalSession::disableRawMode() {
+#ifdef _WIN32
+    if (rawModeEnabled_) {
+        SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), origInMode_);
+        SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), origOutMode_);
+        rawModeEnabled_ = false;
+    }
+#else
     if (rawModeEnabled_) {
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &origTermios_);
         rawModeEnabled_ = false;
     }
+#endif
 }
 
 void TerminalSession::enterAltScreen() const {
+#ifdef _WIN32
+    const int n = _write(_fileno(stdout), "\033[?1049h", 8);
+    (void)n;
+#else
     const ssize_t n = write(STDOUT_FILENO, "\033[?1049h", 8);
     (void)n;
+#endif
 }
 
 void TerminalSession::leaveAltScreen() const {
+#ifdef _WIN32
+    const int n = _write(_fileno(stdout), "\033[?1049l", 8);
+    (void)n;
+#else
     const ssize_t n = write(STDOUT_FILENO, "\033[?1049l", 8);
     (void)n;
+#endif
 }
 
 void Viewport::setFrame(const std::vector<std::string>& lines) {
@@ -133,7 +188,11 @@ void Viewport::render(int scrollOffset) {
     out << Color::INVERSE << " \u2191\u2193 Scroll  PgUp/PgDn  Home/End  q Quit " << Color::RESET << "\033[K";
 
     const std::string frame = out.str();
+#ifdef _WIN32
+    const int n = _write(_fileno(stdout), frame.c_str(), static_cast<unsigned int>(frame.size()));
+#else
     const ssize_t n = write(STDOUT_FILENO, frame.c_str(), frame.size());
+#endif
     (void)n;
 }
 
