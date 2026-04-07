@@ -5,6 +5,7 @@
 #include <csignal>
 #include <ctime>
 #include <cmath>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -541,17 +542,29 @@ int PCHealthMonitorApp::run() {
     const auto refreshInterval = std::chrono::seconds(2);
     const auto renderInterval = std::chrono::milliseconds(33);
     auto nextRefresh = std::chrono::steady_clock::now() + refreshInterval;
+    std::future<std::vector<std::string>> pendingRefresh;
+    bool refreshInFlight = false;
 
     int lastRenderedScroll = -1;
 
     while (running_) {
         bool frameRebuilt = false;
         const auto now = std::chrono::steady_clock::now();
-        if (now >= nextRefresh) {
-            lines = buildFrame();
-            totalLines_ = static_cast<int>(lines.size());
+
+        if (!refreshInFlight && now >= nextRefresh) {
+            pendingRefresh = std::async(std::launch::async, [this]() {
+                return this->buildFrame();
+            });
+            refreshInFlight = true;
             nextRefresh = now + refreshInterval;
+        }
+
+        if (refreshInFlight && pendingRefresh.valid() &&
+            pendingRefresh.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            lines = pendingRefresh.get();
+            totalLines_ = static_cast<int>(lines.size());
             frameRebuilt = true;
+            refreshInFlight = false;
         }
 
         const TermSize ts = getTermSize();
@@ -574,6 +587,10 @@ int PCHealthMonitorApp::run() {
         }
 
         std::this_thread::sleep_for(renderInterval);
+    }
+
+    if (refreshInFlight && pendingRefresh.valid()) {
+        (void)pendingRefresh.get();
     }
 
     if (inputThread.joinable()) {

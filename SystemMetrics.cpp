@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -26,6 +27,15 @@ namespace fs = std::filesystem;
 namespace pcm {
 
 namespace {
+
+#ifdef _WIN32
+bool cacheValid(const std::chrono::steady_clock::time_point& ts, std::chrono::milliseconds ttl) {
+    if (ts == std::chrono::steady_clock::time_point {}) {
+        return false;
+    }
+    return (std::chrono::steady_clock::now() - ts) < ttl;
+}
+#endif
 
 std::string readFile(const std::string& path) {
     std::ifstream file(path);
@@ -210,6 +220,12 @@ double CPUMonitor::getUsage(std::vector<double>& perCore) {
 CPUInfo SystemMetrics::getCPUInfo() {
     CPUInfo info;
 #ifdef _WIN32
+    static CPUInfo cached;
+    static std::chrono::steady_clock::time_point lastRefresh {};
+    if (cacheValid(lastRefresh, std::chrono::minutes(10))) {
+        return cached;
+    }
+
     info.logicalCores = static_cast<int>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
     info.modelName = execCommand("powershell -NoProfile -Command \"(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)\"");
     if (info.modelName.empty()) {
@@ -257,7 +273,9 @@ CPUInfo SystemMetrics::getCPUInfo() {
             break;
     }
 
-    return info;
+    cached = info;
+    lastRefresh = std::chrono::steady_clock::now();
+    return cached;
 #else
     info.logicalCores = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
 
@@ -326,15 +344,23 @@ CPUInfo SystemMetrics::getCPUInfo() {
 double SystemMetrics::getCurrentAvgMHz(int logicalCores) {
 #ifdef _WIN32
     (void)logicalCores;
+    static double cachedMhz = 0.0;
+    static std::chrono::steady_clock::time_point lastRefresh {};
+    if (cacheValid(lastRefresh, std::chrono::seconds(8))) {
+        return cachedMhz;
+    }
+
     const std::string cur =
         execCommand("powershell -NoProfile -Command \"(Get-CimInstance Win32_Processor | Measure-Object -Property CurrentClockSpeed -Average).Average\"");
     if (cur.empty()) {
-        return 0.0;
+        return cachedMhz;
     }
     try {
-        return std::stod(cur);
+        cachedMhz = std::stod(cur);
+        lastRefresh = std::chrono::steady_clock::now();
+        return cachedMhz;
     } catch (...) {
-        return 0.0;
+        return cachedMhz;
     }
 #else
     double total = 0.0;
@@ -557,6 +583,12 @@ std::vector<GPUInfo> SystemMetrics::getGPUInfo() {
     std::vector<GPUInfo> gpus;
 
 #ifdef _WIN32
+    static std::vector<GPUInfo> cached;
+    static std::chrono::steady_clock::time_point lastRefresh {};
+    if (cacheValid(lastRefresh, std::chrono::seconds(30))) {
+        return cached;
+    }
+
     const std::string output = execCommand(
         "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name + '|' + $_.DriverVersion + '|' + $_.AdapterRAM }\"");
     if (!output.empty()) {
@@ -585,7 +617,9 @@ std::vector<GPUInfo> SystemMetrics::getGPUInfo() {
             }
         }
     }
-    return gpus;
+    cached = gpus;
+    lastRefresh = std::chrono::steady_clock::now();
+    return cached;
 #else
 
     const std::string nvidia = execCommand(
@@ -643,6 +677,12 @@ std::vector<NetworkInfo> SystemMetrics::getNetworkInfo() {
     std::vector<NetworkInfo> nets;
 
 #ifdef _WIN32
+    static std::vector<NetworkInfo> cached;
+    static std::chrono::steady_clock::time_point lastRefresh {};
+    if (cacheValid(lastRefresh, std::chrono::seconds(10))) {
+        return cached;
+    }
+
     const std::string output = execCommand(
         "powershell -NoProfile -Command \"Get-NetAdapter -Physical | ForEach-Object { $_.Name + '|' + $_.Status + '|' + $_.LinkSpeed + '|' + $_.MacAddress }\"");
     if (!output.empty()) {
@@ -664,7 +704,9 @@ std::vector<NetworkInfo> SystemMetrics::getNetworkInfo() {
             }
         }
     }
-    return nets;
+    cached = nets;
+    lastRefresh = std::chrono::steady_clock::now();
+    return cached;
 #else
 
     try {
@@ -716,6 +758,12 @@ BatteryInfo SystemMetrics::getBatteryInfo() {
     BatteryInfo b;
 
 #ifdef _WIN32
+    static BatteryInfo cached;
+    static std::chrono::steady_clock::time_point lastRefresh {};
+    if (cacheValid(lastRefresh, std::chrono::seconds(15))) {
+        return cached;
+    }
+
     const std::string output = execCommand(
         "powershell -NoProfile -Command \"Get-CimInstance Win32_Battery | Select-Object -First 1 EstimatedChargeRemaining,BatteryStatus | ForEach-Object { $_.EstimatedChargeRemaining.ToString() + '|' + $_.BatteryStatus.ToString() }\"");
     if (!output.empty()) {
@@ -740,7 +788,9 @@ BatteryInfo SystemMetrics::getBatteryInfo() {
             b.status = "Unknown";
         }
     }
-    return b;
+    cached = b;
+    lastRefresh = std::chrono::steady_clock::now();
+    return cached;
 #else
 
     auto readDouble = [](const std::string& path) -> double {
@@ -820,6 +870,12 @@ OSInfo SystemMetrics::getOSInfo() {
     OSInfo info;
 
 #ifdef _WIN32
+    static OSInfo cached;
+    static std::chrono::steady_clock::time_point lastRefresh {};
+    if (cacheValid(lastRefresh, std::chrono::minutes(10))) {
+        return cached;
+    }
+
     info.prettyName = execCommand("powershell -NoProfile -Command \"(Get-CimInstance Win32_OperatingSystem).Caption\"");
     if (info.prettyName.empty()) {
         info.prettyName = "Windows";
@@ -831,7 +887,9 @@ OSInfo SystemMetrics::getOSInfo() {
     if (GetComputerNameA(host, &hostLen)) {
         info.hostname = host;
     }
-    return info;
+    cached = info;
+    lastRefresh = std::chrono::steady_clock::now();
+    return cached;
 #else
 
     std::ifstream file("/etc/os-release");
@@ -903,6 +961,12 @@ std::string SystemMetrics::getUptime() {
 
 int SystemMetrics::getProcessCount() {
 #ifdef _WIN32
+    static int cachedCount = 0;
+    static std::chrono::steady_clock::time_point lastRefresh {};
+    if (cacheValid(lastRefresh, std::chrono::seconds(3))) {
+        return cachedCount;
+    }
+
     int count = 0;
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
@@ -917,7 +981,9 @@ int SystemMetrics::getProcessCount() {
         } while (Process32Next(snapshot, &pe));
     }
     CloseHandle(snapshot);
-    return count;
+    cachedCount = count;
+    lastRefresh = std::chrono::steady_clock::now();
+    return cachedCount;
 #else
     int count = 0;
     try {
@@ -936,6 +1002,13 @@ int SystemMetrics::getProcessCount() {
 std::vector<ProcessInfo> SystemMetrics::getTopProcesses(int count) {
     std::vector<ProcessInfo> procs;
 #ifdef _WIN32
+    static std::vector<ProcessInfo> cached;
+    static int cachedCount = 0;
+    static std::chrono::steady_clock::time_point lastRefresh {};
+    if (cachedCount == count && cacheValid(lastRefresh, std::chrono::seconds(5))) {
+        return cached;
+    }
+
     const std::string cmd =
         "powershell -NoProfile -Command \"Get-Process | Sort-Object CPU -Descending | Select-Object -First " +
         std::to_string(count) +
@@ -968,7 +1041,10 @@ std::vector<ProcessInfo> SystemMetrics::getTopProcesses(int count) {
         }
         procs.push_back(p);
     }
-    return procs;
+    cached = procs;
+    cachedCount = count;
+    lastRefresh = std::chrono::steady_clock::now();
+    return cached;
 #else
     const std::string output =
         execCommand("ps aux --sort=-%cpu --no-headers 2>/dev/null | head -" + std::to_string(count));
