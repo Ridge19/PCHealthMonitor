@@ -25,6 +25,11 @@ PCHealthMonitorApp* PCHealthMonitorApp::instance_ = nullptr;
 
 namespace {
 
+constexpr auto kInputPollInterval = std::chrono::milliseconds(16);
+constexpr auto kRenderInterval = std::chrono::milliseconds(16);
+constexpr int kEscapeSeqMaxBytes = 4;
+constexpr int kEscapeSeqTotalBudgetMs = 12;
+
 std::string platformLabel() {
 #ifdef _WIN32
     return "Windows";
@@ -371,7 +376,7 @@ void PCHealthMonitorApp::inputLoop() {
 #ifdef _WIN32
     while (running_) {
         if (!_kbhit()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(kInputPollInterval);
             continue;
         }
 
@@ -427,7 +432,7 @@ void PCHealthMonitorApp::inputLoop() {
         pfd.fd = STDIN_FILENO;
         pfd.events = POLLIN;
 
-        const int ret = poll(&pfd, 1, 50);
+        const int ret = poll(&pfd, 1, static_cast<int>(kInputPollInterval.count()));
         if (ret <= 0 || !(pfd.revents & POLLIN)) {
             continue;
         }
@@ -446,65 +451,44 @@ void PCHealthMonitorApp::inputLoop() {
         if (c == 'q' || c == 'Q') {
             running_ = false;
         } else if (c == '\033') {
-            char seq[5] = {};
+            char seq[kEscapeSeqMaxBytes + 1] = {};
+            int seqLen = 0;
             struct pollfd pf2 {};
             pf2.fd = STDIN_FILENO;
             pf2.events = POLLIN;
 
-            if (poll(&pf2, 1, 30) > 0) {
-                const ssize_t n = read(STDIN_FILENO, &seq[0], 1);
-                (void)n;
-            }
-            if (poll(&pf2, 1, 30) > 0) {
-                const ssize_t n = read(STDIN_FILENO, &seq[1], 1);
-                (void)n;
+            // Collect the remaining ANSI escape sequence bytes quickly with a small total time budget.
+            int remainingBudget = kEscapeSeqTotalBudgetMs;
+            while (seqLen < kEscapeSeqMaxBytes && remainingBudget > 0) {
+                const int step = std::min(remainingBudget, 2);
+                const int ready = poll(&pf2, 1, step);
+                remainingBudget -= step;
+                if (ready <= 0 || !(pf2.revents & POLLIN)) {
+                    continue;
+                }
+
+                const ssize_t n = read(STDIN_FILENO, &seq[seqLen], 1);
+                if (n == 1) {
+                    ++seqLen;
+                } else {
+                    break;
+                }
             }
 
-            if (seq[0] == '[') {
-                switch (seq[1]) {
-                    case 'A':
-                        scrollOffset_ = std::max(0, current - 1);
-                        break;
-                    case 'B':
-                        scrollOffset_ = std::min(maxScroll, current + 1);
-                        break;
-                    case '5':
-                        if (poll(&pf2, 1, 30) > 0) {
-                            const ssize_t n = read(STDIN_FILENO, &seq[2], 1);
-                            (void)n;
-                        }
-                        scrollOffset_ = std::max(0, current - viewHeight);
-                        break;
-                    case '6':
-                        if (poll(&pf2, 1, 30) > 0) {
-                            const ssize_t n = read(STDIN_FILENO, &seq[2], 1);
-                            (void)n;
-                        }
-                        scrollOffset_ = std::min(maxScroll, current + viewHeight);
-                        break;
-                    case 'H':
-                        scrollOffset_ = 0;
-                        break;
-                    case 'F':
-                        scrollOffset_ = maxScroll;
-                        break;
-                    case '1':
-                        if (poll(&pf2, 1, 30) > 0) {
-                            const ssize_t n = read(STDIN_FILENO, &seq[2], 1);
-                            (void)n;
-                        }
-                        scrollOffset_ = 0;
-                        break;
-                    case '4':
-                        if (poll(&pf2, 1, 30) > 0) {
-                            const ssize_t n = read(STDIN_FILENO, &seq[2], 1);
-                            (void)n;
-                        }
-                        scrollOffset_ = maxScroll;
-                        break;
-                    default:
-                        break;
-                }
+            const std::string escSeq(seq, seq + seqLen);
+
+            if (escSeq == "[A") {
+                scrollOffset_ = std::max(0, current - 1);
+            } else if (escSeq == "[B") {
+                scrollOffset_ = std::min(maxScroll, current + 1);
+            } else if (escSeq == "[5~") {
+                scrollOffset_ = std::max(0, current - viewHeight);
+            } else if (escSeq == "[6~") {
+                scrollOffset_ = std::min(maxScroll, current + viewHeight);
+            } else if (escSeq == "[H" || escSeq == "[1~" || escSeq == "OH") {
+                scrollOffset_ = 0;
+            } else if (escSeq == "[F" || escSeq == "[4~" || escSeq == "OF") {
+                scrollOffset_ = maxScroll;
             }
         } else if (c == 'k' || c == 'K') {
             scrollOffset_ = std::max(0, current - 1);
@@ -532,7 +516,6 @@ int PCHealthMonitorApp::run() {
 
     std::vector<double> dummy;
     cpuMonitor_.getUsage(dummy);
-    std::this_thread::sleep_for(std::chrono::seconds(1));
 
     std::thread inputThread(&PCHealthMonitorApp::inputLoop, this);
 
@@ -540,7 +523,7 @@ int PCHealthMonitorApp::run() {
     totalLines_ = static_cast<int>(lines.size());
 
     const auto refreshInterval = std::chrono::seconds(2);
-    const auto renderInterval = std::chrono::milliseconds(33);
+    const auto renderInterval = kRenderInterval;
     auto nextRefresh = std::chrono::steady_clock::now() + refreshInterval;
     std::future<std::vector<std::string>> pendingRefresh;
     bool refreshInFlight = false;
